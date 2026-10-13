@@ -162,10 +162,12 @@ impl Widget for Notifications {
                 close(id, Reason::Dismissed)
             }
             Message::Action(id, key) => {
-                // One that stays, or one of several questions, is the app's to change or close.
-                let stays = self
-                    .find(id)
-                    .is_some_and(|n| n.resident || n.step.is_some());
+                // One that stays is the app's to change or close; so is one of several questions
+                // while it's answered or gone back on, as the app moves it on in place. Anything
+                // else, like a click that opens the app, takes it away.
+                let stays = self.find(id).is_some_and(|n| {
+                    n.resident || (n.step.is_some() && (key == BACK || is_choice(n, &key)))
+                });
                 if !stays {
                     self.forget(id);
                 }
@@ -848,6 +850,14 @@ fn thread(notification: &Notification) -> Option<String> {
     })
 }
 
+/// Whether `key` is one of its options'.
+fn is_choice(notification: &Notification, key: &str) -> bool {
+    notification
+        .choices
+        .as_ref()
+        .is_some_and(|choices| choices.options.iter().any(|option| option.key == key))
+}
+
 fn has_action(notification: &Notification, key: &str) -> bool {
     notification.actions.iter().any(|(given, _)| given == key)
 }
@@ -1205,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resident_one_and_a_question_of_several_stay_after_an_action() {
+    fn a_resident_one_stays_after_an_action_and_a_question_only_while_answered() {
         let mut widget = notifications();
         let mut resident = notification(1, eave_notify::Urgency::Normal);
         resident.resident = true;
@@ -1214,8 +1224,12 @@ mod tests {
         step.step = Some((0, 2));
         arrive_as(&mut widget, step);
         let _ = widget.update(Message::Action(1, "reply".into()));
-        let _ = widget.update(Message::Action(2, "reply".into()));
-        assert_eq!(widget.inbox.len(), 2);
+        assert_eq!(widget.inbox.len(), 2, "resident: stays");
+        let _ = widget.update(Message::Action(2, BACK.into()));
+        assert_eq!(widget.inbox.len(), 2, "going back: the app moves it");
+        // A click that opens the app takes even a question of several away.
+        let _ = widget.update(Message::Action(2, "default".into()));
+        assert_eq!(widget.inbox.len(), 1);
     }
 
     fn choosing(id: u32, multiple: bool) -> Notification {
