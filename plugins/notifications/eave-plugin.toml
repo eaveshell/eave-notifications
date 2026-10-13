@@ -1,0 +1,5 @@
+# Plugin manifest, beside the crate's Cargo.toml.
+[plugin]
+name = "notifications"
+description = "Notifications: the right island turns into them, a bell, and the latest ones and their history in the popover"
+api = "0.1"

@@ -1,0 +1,20 @@
+[package]
+name = "eave-notify"
+version = "0.1.0"
+description = "A freedesktop notification server for eave plugins"
+keywords = ["notifications", "dbus", "freedesktop", "eave"]
+categories = ["gui"]
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# The bodies of plain calls to the bus. Already in the build through zbus.
+serde = { version = "1", default-features = false, features = ["std"] }
+# Broadcasts what arrives to every watcher, starts the server once, and waits for the name (D-48).
+# The bar's runtime, already in the build through iced.
+tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
+# Serves org.freedesktop.Notifications on the session bus. The same zbus as eave's eave-dbus, so a
+# bar builds one.
+zbus = { version = "5", default-features = false, features = ["tokio"] }

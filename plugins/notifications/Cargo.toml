@@ -1,0 +1,17 @@
+[package]
+name = "eave-notifications"
+version = "0.1.0"
+description = "Notifications for eave: the right island turns into them, a bell, and the latest ones and their history in the popover"
+# Compiled into a bar by eave-build, from git.
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+eave-api.workspace = true
+eave-notify.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

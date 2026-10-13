@@ -1,0 +1,5 @@
+# `widget = "eaveshell/eave-notifications"` in eave's config.toml picks the plugin named
+# `notifications` here.
+[collection]
+description = "eave's notification server and its widget"
+plugins = ["plugins/notifications"]
