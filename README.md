@@ -24,9 +24,9 @@ shows when it doesn't say, default 5) and `history` (how many the History tab ke
 - **Icons and Markdown:** an app's icon comes from your icon theme, or from a picture file the app
   names (`image-path`, or a path as its icon). An app that sends the `x-eave-markdown` hint gets its
   body set as Markdown.
-- **The bell:** a count of the ones that arrived since you last looked and that you didn't deal
-  with yourself. Right click for do not disturb: only critical ones show, the rest only go to the
-  list. In its popover: the ones waiting for you (click one for all of it and its actions), and a
+- **The bell:** a red badge on its corner counts the ones that arrived since you last looked and
+  that you didn't deal with yourself. Right click for do not disturb: only critical ones show, the
+  rest only go to the list, and the badge hides until you turn it off again. In its popover: the ones waiting for you (click one for all of it and its actions), and a
   History tab with every one that arrived. Once you've looked, they're read: closing the popover
   moves them on to the history.
 
