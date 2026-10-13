@@ -1,7 +1,7 @@
 //! Notifications, through eave's own notification server ([`eave_notify`]). While there are any,
 //! the right island turns into a panel of them. Each goes away after a few seconds, when
-//! dismissed, or when one of its actions is picked. The bar shows a bell, with a count of the ones that arrived since the
-//! popover was last opened. The popover lists the latest ones. Right click on the bell for do not
+//! dismissed, or when one of its actions is picked. The bar shows a bell, with a red badge counting
+//! the ones that arrived since the popover was last opened. The popover lists the latest ones. Right click on the bell for do not
 //! disturb: notifications only go to the list, except critical ones.
 //!
 //! If another notification daemon is running, it keeps the notifications, and the bell is dimmed
@@ -240,10 +240,9 @@ impl Widget for Notifications {
 
     fn item(&self) -> Item<Message> {
         let bell = ui::icon(Icon::Bell { muted: self.quiet });
-        let content = match self.unread.len() {
-            0 => bell,
-            unread => ui::row([bell, ui::counter(unread.min(99) as i64, 0..=99, "")]),
-        };
+        // Do not disturb hides the count, not what it counts: turned off, it shows what came.
+        let unread = if self.quiet { 0 } else { self.unread.len() };
+        let content = ui::counted(bell, u32::try_from(unread).unwrap_or(u32::MAX));
         let content = if self.status == Status::Serving {
             content
         } else {
@@ -615,6 +614,29 @@ mod tests {
     fn arrive(widget: &mut Notifications, id: u32) {
         let notification = notification(id, eave_notify::Urgency::Normal);
         let _ = widget.update(Message::Server(Event::Notified(Box::new(notification))));
+    }
+
+    /// The count on the bell's badge.
+    fn badge(widget: &Notifications) -> u32 {
+        let content = widget.item().into_parts().content.expect("a bell");
+        match content.kind() {
+            ui::Kind::Counted { count, .. } => *count,
+            _ => panic!("a counted bell"),
+        }
+    }
+
+    #[test]
+    fn the_badge_counts_unread_and_hides_in_do_not_disturb() {
+        let mut widget = notifications();
+        assert_eq!(badge(&widget), 0);
+        arrive(&mut widget, 1);
+        arrive(&mut widget, 2);
+        assert_eq!(badge(&widget), 2);
+        let _ = widget.update(Message::ToggleQuiet);
+        assert_eq!(badge(&widget), 0);
+        arrive(&mut widget, 3);
+        let _ = widget.update(Message::ToggleQuiet);
+        assert_eq!(badge(&widget), 3, "what came while quiet shows after");
     }
 
     #[test]
