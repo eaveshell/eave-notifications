@@ -13,13 +13,14 @@
 //! over once that daemon quits. It never pushes one out.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use futures_util::{Stream, StreamExt, stream};
 use tokio::sync::{OnceCell, broadcast};
 use zbus::fdo::RequestNameReply;
-use zbus::zvariant::OwnedValue;
+use zbus::zvariant::{OwnedValue, Value};
 use zbus::{MatchRule, MessageStream};
 
 mod markup;
@@ -36,8 +37,10 @@ pub struct Notification {
     pub id: u32,
     /// The app's name, as it gave it. May be empty.
     pub app: String,
-    /// Its icon: an app id to find it by, or a picture file.
+    /// The app's icon: an app id to find it by, or a file.
     pub icon: Option<Icon>,
+    /// A picture of its own: an avatar, a screenshot.
+    pub image: Option<Image>,
     pub summary: String,
     /// Plain text, markup stripped and entities decoded. Or Markdown as the app wrote it, if
     /// [`markdown`](Self::markdown).
@@ -52,6 +55,21 @@ pub struct Notification {
     pub urgency: Urgency,
     pub timeout: Timeout,
     pub received: SystemTime,
+    /// How far along what it's about is, from 0 to 1: the `value` hint, a percentage.
+    pub progress: Option<f32>,
+    /// The conversation it's part of (`x-eave-thread`), and what to call it
+    /// (`x-eave-thread-name`).
+    pub thread: Option<String>,
+    pub thread_name: Option<String>,
+    /// Options to pick from (`x-eave-choices`), instead of or besides actions.
+    pub choices: Option<Choices>,
+    /// It's question `index` (from 0) of `count`, asked one at a time (`x-eave-step`). Going back
+    /// is the `x-eave-back` action.
+    pub step: Option<(u32, u32)>,
+    /// Not to be kept once it's off the screen (`transient`).
+    pub transient: bool,
+    /// Stays after an action is picked, until the app or the user closes it (`resident`).
+    pub resident: bool,
 }
 
 impl Notification {
@@ -64,14 +82,57 @@ impl Notification {
     }
 }
 
-/// Where a notification's icon comes from.
+/// Where a notification's app icon comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Icon {
     /// An app id to find it in the icon theme by: the `desktop-entry` hint, or an `app_icon`
-    /// that names an icon.
+    /// (or `image-path`) that names an icon.
     App(String),
-    /// A picture file, as a `file://` URL: the `image-path` hint, or an `app_icon` that is a path.
+    /// A file, as a `file://` URL: the `x-eave-icon` hint. An `app_icon` that is a path is taken
+    /// as the notification's picture instead, as `notify-send -i` means it.
     File(String),
+}
+
+/// A notification's own picture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Image {
+    /// A file, as a `file://` URL: the `image-path` hint, or an `app_icon` that is a path.
+    File(String),
+    /// Pixels the app sent: the `image-data` hint.
+    Pixels(Pixels),
+}
+
+/// A picture as its pixels: RGBA, 8 bits a channel, row after row with nothing between them.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Pixels {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for Pixels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Pixels({}×{})", self.width, self.height)
+    }
+}
+
+/// Options to pick from, eave's extension to the spec (`x-eave-choices`, `x-eave-multiple`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choices {
+    pub options: Vec<Choice>,
+    /// Several can be picked, and sent together ([`picked`]). Otherwise a pick is an action
+    /// ([`invoke`]) with the option's key.
+    pub multiple: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub key: String,
+    pub label: String,
+    /// What it means, if the app said. May be empty.
+    pub description: String,
+    /// The one the app suggests.
+    pub recommended: bool,
 }
 
 /// A notification's inline reply: KDE's extension to the spec, which messengers use. The app
@@ -178,6 +239,15 @@ pub async fn invoke(id: u32, key: &str) -> zbus::Result<()> {
     server
         .connection
         .emit_signal(None::<()>, PATH, NAME, "ActionInvoked", &(id, key))
+        .await
+}
+
+/// Sends the app the options picked on its notification, by key ([`Choices::multiple`]).
+pub async fn picked(id: u32, keys: &[String]) -> zbus::Result<()> {
+    let server = server().await?;
+    server
+        .connection
+        .emit_signal(None::<()>, PATH, NAME, "EaveChoicesPicked", &(id, keys))
         .await
 }
 
@@ -303,7 +373,10 @@ impl Notifications {
             "body-markup",
             "icon-static",
             "inline-reply",
+            "x-eave-choices",
+            "x-eave-icon",
             "x-eave-markdown",
+            "x-eave-thread",
         ]
     }
 
@@ -325,18 +398,27 @@ impl Notifications {
         };
         let (reply, actions) = split_reply(pairs(actions), &hints);
         let markdown = flag(&hints, "x-eave-markdown");
+        let urgency = urgency(&hints);
         let notification = Notification {
             id,
             reply,
             icon: icon(&app_icon, &hints),
+            image: image(&app_icon, &hints),
             app: app_name,
             summary: strip(&summary),
             body: if markdown { body } else { strip(&body) },
             markdown,
             actions,
-            urgency: urgency(&hints),
-            timeout: timeout(expire_timeout, urgency(&hints)),
+            urgency,
+            timeout: timeout(expire_timeout, urgency),
             received: SystemTime::now(),
+            progress: progress(&hints),
+            thread: text(&hints, "x-eave-thread"),
+            thread_name: text(&hints, "x-eave-thread-name"),
+            choices: choices(&hints),
+            step: step(&hints),
+            transient: flag(&hints, "transient"),
+            resident: flag(&hints, "resident"),
         };
         let _ = bus().send(Event::Notified(Box::new(notification)));
         id
@@ -351,38 +433,169 @@ impl Notifications {
     }
 }
 
-/// The icon: a picture file the app gave (the `image-path` hint, or a path as its icon), else
-/// an app id (the `desktop-entry` hint, or its icon's name).
+/// A text hint, if it's there and not empty.
+fn text(hints: &HashMap<String, OwnedValue>, hint: &str) -> Option<String> {
+    hints
+        .get(hint)
+        .and_then(|value| <&str>::try_from(value).ok())
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+/// `path` as a `file://` URL, if it's a path.
+fn file(path: &str) -> Option<String> {
+    if path.starts_with("file://") {
+        Some(path.to_string())
+    } else if path.starts_with('/') {
+        Some(format!("file://{path}"))
+    } else {
+        None
+    }
+}
+
+/// The app's icon: a file eave was given for it (`x-eave-icon`), else an app id (the
+/// `desktop-entry` hint, or its icon's name).
 fn icon(app_icon: &str, hints: &HashMap<String, OwnedValue>) -> Option<Icon> {
-    let text = |hint: &str| {
-        hints
-            .get(hint)
-            .and_then(|value| <&str>::try_from(value).ok())
-            .filter(|text| !text.is_empty())
-    };
-    let file = |path: &str| {
-        if path.starts_with("file://") {
-            Some(path.to_string())
-        } else if path.starts_with('/') {
-            Some(format!("file://{path}"))
-        } else {
-            None
-        }
-    };
-    let picture = text("image-path")
-        .or(text("image_path"))
-        .and_then(file)
-        .or_else(|| file(app_icon));
-    if let Some(picture) = picture {
-        return Some(Icon::File(picture));
+    if let Some(url) = text(hints, "x-eave-icon").as_deref().and_then(file) {
+        return Some(Icon::File(url));
     }
     // An image-path may also name an icon, as app_icon can.
     let named = |name: &str| (!name.is_empty() && !name.contains('/')).then(|| name.to_string());
-    text("desktop-entry")
-        .map(str::to_string)
+    text(hints, "desktop-entry")
         .or_else(|| named(app_icon))
-        .or_else(|| text("image-path").and_then(named))
+        .or_else(|| text(hints, "image-path").as_deref().and_then(named))
         .map(Icon::App)
+}
+
+/// Its own picture, in the spec's order: pixels it sent, a file it named, a path as its icon.
+fn image(app_icon: &str, hints: &HashMap<String, OwnedValue>) -> Option<Image> {
+    let pixels = ["image-data", "image_data", "icon_data"]
+        .iter()
+        .find_map(|hint| pixels(hints.get(*hint)?));
+    if let Some(pixels) = pixels {
+        return Some(Image::Pixels(pixels));
+    }
+    text(hints, "image-path")
+        .or_else(|| text(hints, "image_path"))
+        .as_deref()
+        .and_then(file)
+        .or_else(|| file(app_icon))
+        .map(Image::File)
+}
+
+/// The largest side of a picture taken as pixels, so a hostile one can't take all the memory.
+const MAX_SIDE: i32 = 4096;
+
+/// The spec's `(iiibiiay)`: width, height, bytes a row, alpha or not, bits a sample (8), samples a
+/// pixel (3 or 4), then the rows. Made RGBA with nothing between rows. `None` if it doesn't add up.
+fn pixels(value: &OwnedValue) -> Option<Pixels> {
+    let structure = match &**value {
+        Value::Structure(structure) => structure,
+        _ => return None,
+    };
+    let fields = structure.fields();
+    let int = |at: usize| match fields.get(at)? {
+        Value::I32(n) => Some(*n),
+        _ => None,
+    };
+    let (width, height, stride) = (int(0)?, int(1)?, int(2)?);
+    let alpha = match fields.get(3)? {
+        Value::Bool(alpha) => *alpha,
+        _ => return None,
+    };
+    let (bits, channels) = (int(4)?, int(5)?);
+    let data: Vec<u8> = match fields.get(6)? {
+        Value::Array(array) => array
+            .iter()
+            .map(|byte| match byte {
+                Value::U8(byte) => Some(*byte),
+                _ => None,
+            })
+            .collect::<Option<_>>()?,
+        _ => return None,
+    };
+    let sized = (1..=MAX_SIDE).contains(&width) && (1..=MAX_SIDE).contains(&height);
+    if !sized || bits != 8 || channels != if alpha { 4 } else { 3 } {
+        return None;
+    }
+    let (width, height, stride, channels) = (
+        width as usize,
+        height as usize,
+        stride as usize,
+        channels as usize,
+    );
+    // The last row may stop where its pixels do.
+    let needed = stride * (height - 1) + width * channels;
+    if stride < width * channels || data.len() < needed {
+        return None;
+    }
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for row in data.chunks(stride).take(height) {
+        for pixel in row[..width * channels].chunks_exact(channels) {
+            rgba.extend_from_slice(&pixel[..3]);
+            rgba.push(if alpha { pixel[3] } else { 255 });
+        }
+    }
+    Some(Pixels {
+        width: width as u32,
+        height: height as u32,
+        rgba: rgba.into(),
+    })
+}
+
+/// The `value` hint, a percentage, as a fraction.
+fn progress(hints: &HashMap<String, OwnedValue>) -> Option<f32> {
+    let value = hints.get("value")?;
+    let percent = i64::try_from(value)
+        .ok()
+        .or_else(|| i32::try_from(value).ok().map(i64::from))
+        .or_else(|| u32::try_from(value).ok().map(i64::from))
+        .or_else(|| u8::try_from(value).ok().map(i64::from))?;
+    Some(percent.clamp(0, 100) as f32 / 100.0)
+}
+
+/// `x-eave-choices`, `a(sssb)`: each option's key, label, description, and whether it's the one
+/// suggested. `x-eave-multiple` says several can be picked.
+fn choices(hints: &HashMap<String, OwnedValue>) -> Option<Choices> {
+    let array = match &**hints.get("x-eave-choices")? {
+        Value::Array(array) => array,
+        _ => return None,
+    };
+    let options: Vec<Choice> = array
+        .iter()
+        .filter_map(|option| {
+            let Value::Structure(option) = option else {
+                return None;
+            };
+            let text = |at: usize| match option.fields().get(at)? {
+                Value::Str(text) => Some(text.to_string()),
+                _ => None,
+            };
+            let recommended = matches!(option.fields().get(3), Some(Value::Bool(true)));
+            let (key, label) = (text(0)?, text(1)?);
+            (!key.is_empty() && !label.is_empty()).then(|| Choice {
+                key,
+                label,
+                description: text(2).unwrap_or_default(),
+                recommended,
+            })
+        })
+        .collect();
+    (!options.is_empty()).then(|| Choices {
+        options,
+        multiple: flag(hints, "x-eave-multiple"),
+    })
+}
+
+/// `x-eave-step`, `(uu)`: which question of how many.
+fn step(hints: &HashMap<String, OwnedValue>) -> Option<(u32, u32)> {
+    let Value::Structure(step) = &**hints.get("x-eave-step")? else {
+        return None;
+    };
+    match step.fields() {
+        [Value::U32(index), Value::U32(count)] if index < count => Some((*index, *count)),
+        _ => None,
+    }
 }
 
 /// A boolean hint, false if it's missing or not a boolean.
@@ -422,13 +635,7 @@ fn split_reply(
     actions: Vec<(String, String)>,
     hints: &HashMap<String, OwnedValue>,
 ) -> (Option<Reply>, Vec<(String, String)>) {
-    let text = |hint: &str| {
-        hints
-            .get(hint)
-            .and_then(|value| <&str>::try_from(value).ok())
-            .filter(|text| !text.is_empty())
-            .map(str::to_string)
-    };
+    let text = |hint: &str| text(hints, hint);
     let (replies, actions): (Vec<_>, Vec<_>) = actions
         .into_iter()
         .partition(|(key, _)| key == "inline-reply");
@@ -490,25 +697,124 @@ mod tests {
     fn the_icon_is_an_app_id_or_a_file() {
         let entry = hints(&[("desktop-entry", text("org.gnome.Nautilus"))]);
         let app = |id: &str| Some(Icon::App(id.into()));
-        let file = |url: &str| Some(Icon::File(url.into()));
         assert_eq!(icon("x", &entry), app("org.gnome.Nautilus"));
         assert_eq!(icon("firefox", &hints(&[])), app("firefox"));
-        assert_eq!(icon("/tmp/a.png", &hints(&[])), file("file:///tmp/a.png"));
-        assert_eq!(
-            icon("file:///tmp/a.png", &hints(&[])),
-            file("file:///tmp/a.png")
-        );
+        assert_eq!(icon("/tmp/a.png", &hints(&[])), None, "a path is a picture");
         assert_eq!(icon("", &hints(&[])), None);
-        // A picture wins over the app's id.
-        let both = hints(&[
-            ("desktop-entry", text("claude")),
-            ("image-path", text("/run/claude.svg")),
-        ]);
-        assert_eq!(icon("", &both), file("file:///run/claude.svg"));
         assert_eq!(
             icon("", &hints(&[("image-path", text("mail"))])),
             app("mail")
         );
+        let file = hints(&[
+            ("desktop-entry", text("claude")),
+            ("x-eave-icon", text("/run/claude.png")),
+        ]);
+        assert_eq!(
+            icon("", &file),
+            Some(Icon::File("file:///run/claude.png".into()))
+        );
+    }
+
+    #[test]
+    fn the_picture_is_pixels_then_a_named_file_then_a_path_as_icon() {
+        let file = |url: &str| Some(Image::File(url.into()));
+        assert_eq!(image("/tmp/a.png", &hints(&[])), file("file:///tmp/a.png"));
+        assert_eq!(
+            image("file:///tmp/a.png", &hints(&[])),
+            file("file:///tmp/a.png")
+        );
+        assert_eq!(image("firefox", &hints(&[])), None);
+        let named = hints(&[("image-path", text("/run/shot.png"))]);
+        assert_eq!(image("/tmp/a.png", &named), file("file:///run/shot.png"));
+        let both = hints(&[
+            ("image-path", text("/run/shot.png")),
+            ("image-data", data(1, 1, 3, false, vec![1, 2, 3])),
+        ]);
+        assert!(matches!(image("", &both), Some(Image::Pixels(_))));
+    }
+
+    fn data(width: i32, height: i32, stride: i32, alpha: bool, bytes: Vec<u8>) -> OwnedValue {
+        let channels = if alpha { 4 } else { 3 };
+        OwnedValue::try_from(Value::from((
+            width, height, stride, alpha, 8i32, channels, bytes,
+        )))
+        .unwrap()
+    }
+
+    #[test]
+    fn pixels_are_made_rgba_row_by_row() {
+        // Two pixels a row, with a byte of padding after each row but the last.
+        let rgb = data(
+            2,
+            2,
+            7,
+            false,
+            vec![1, 2, 3, 4, 5, 6, 0, 7, 8, 9, 10, 11, 12],
+        );
+        let pixels = pixels(&rgb).expect("pixels");
+        assert_eq!((pixels.width, pixels.height), (2, 2));
+        assert_eq!(
+            &*pixels.rgba,
+            [1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255]
+        );
+        let rgba = data(1, 1, 4, true, vec![1, 2, 3, 4]);
+        assert_eq!(&*pixels_of(&rgba), [1, 2, 3, 4]);
+    }
+
+    fn pixels_of(value: &OwnedValue) -> Arc<[u8]> {
+        pixels(value).unwrap().rgba
+    }
+
+    #[test]
+    fn pixels_that_dont_add_up_are_dropped() {
+        assert!(
+            pixels(&data(2, 2, 6, false, vec![0; 11])).is_none(),
+            "short"
+        );
+        assert!(
+            pixels(&data(2, 2, 5, false, vec![0; 12])).is_none(),
+            "rows overlap"
+        );
+        assert!(pixels(&data(0, 2, 6, false, Vec::new())).is_none(), "empty");
+        assert!(
+            pixels(&data(5000, 1, 15000, false, vec![0; 15000])).is_none(),
+            "huge"
+        );
+        assert!(pixels(&text("no")).is_none());
+    }
+
+    #[test]
+    fn progress_is_a_clamped_percentage() {
+        assert_eq!(progress(&hints(&[("value", 40i32.into())])), Some(0.4));
+        assert_eq!(progress(&hints(&[("value", 140u32.into())])), Some(1.0));
+        assert_eq!(progress(&hints(&[])), None);
+    }
+
+    #[test]
+    fn choices_and_steps_come_from_eave_s_hints() {
+        let options = vec![
+            ("a", "Apple", "Sweet", true),
+            ("p", "Pear", "", false),
+            ("", "Nothing", "", false),
+        ];
+        let hints = hints(&[
+            (
+                "x-eave-choices",
+                OwnedValue::try_from(Value::from(options)).unwrap(),
+            ),
+            ("x-eave-multiple", true.into()),
+            (
+                "x-eave-step",
+                OwnedValue::try_from(Value::from((1u32, 3u32))).unwrap(),
+            ),
+        ]);
+        let choices = choices(&hints).expect("choices");
+        assert!(choices.multiple);
+        let keys: Vec<_> = choices.options.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["a", "p"], "one without a key is dropped");
+        assert!(choices.options[0].recommended);
+        assert_eq!(choices.options[0].description, "Sweet");
+        assert_eq!(step(&hints), Some((1, 3)));
     }
 
     #[test]
