@@ -50,7 +50,7 @@ enum Status {
 pub struct Notifications {
     config: Config,
     status: Status,
-    /// The notifications still waiting for you, newest first: the popover's first tab.
+    /// The notifications you haven't seen in the popover yet, newest first: its first tab.
     inbox: Vec<Notification>,
     /// Every notification that arrived, newest first, whatever became of it: the History tab.
     past: Vec<Notification>,
@@ -203,16 +203,7 @@ impl Widget for Notifications {
                 self.expanded_past = (self.expanded_past != Some(id)).then_some(id);
                 Effect::none()
             }
-            Message::Clear => {
-                let ids: Vec<_> = self.inbox.drain(..).map(|n| n.id).collect();
-                self.shown.clear();
-                Effect::task(Task::batch(ids.into_iter().map(|id| {
-                    Task::future(async move {
-                        let _ = eave_notify::close(id, Reason::Dismissed).await;
-                    })
-                    .discard()
-                })))
-            }
+            Message::Clear => self.clear(),
             Message::ToggleQuiet => {
                 self.quiet = !self.quiet;
                 if self.quiet {
@@ -236,7 +227,8 @@ impl Widget for Notifications {
                 self.expanded = None;
                 self.expanded_past = None;
                 self.answering = None;
-                Effect::none()
+                // Seen, so read: they go on to the history, and the next open starts empty.
+                self.clear()
             }
             Message::Tick => {
                 self.now = SystemTime::now();
@@ -389,6 +381,18 @@ impl Notifications {
             self.shown.insert(0, id);
         }
         Effect::none()
+    }
+
+    /// Takes everything out of the list and off the screen. The history keeps them.
+    fn clear(&mut self) -> Effect<Message> {
+        let ids: Vec<_> = self.inbox.drain(..).map(|n| n.id).collect();
+        self.shown.clear();
+        Effect::task(Task::batch(ids.into_iter().map(|id| {
+            Task::future(async move {
+                let _ = eave_notify::close(id, Reason::Dismissed).await;
+            })
+            .discard()
+        })))
     }
 
     /// Off the screen and out of the list, and no longer news.
@@ -791,6 +795,20 @@ mod tests {
         assert!(widget.unread.is_empty());
         arrive(&mut widget, 2);
         assert!(widget.unread.is_empty(), "seen while open");
+    }
+
+    #[test]
+    fn closing_the_popover_hands_new_over_to_history() {
+        let mut widget = notifications();
+        arrive(&mut widget, 1);
+        let _ = widget.update(Message::Opened);
+        assert_eq!(widget.inbox.len(), 1, "still new while it's open");
+        arrive(&mut widget, 2);
+        let _ = widget.update(Message::Closed);
+        assert!(widget.inbox.is_empty());
+        assert!(widget.notices().is_empty());
+        let past: Vec<_> = widget.past.iter().map(|n| n.id).collect();
+        assert_eq!(past, [2, 1]);
     }
 
     #[test]
