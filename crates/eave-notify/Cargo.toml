@@ -1,6 +1,6 @@
 [package]
 name = "eave-notify"
-version = "0.1.0"
+version = "0.2.0"
 description = "A freedesktop notification server for eave plugins"
 keywords = ["notifications", "dbus", "freedesktop", "eave"]
 categories = ["gui"]

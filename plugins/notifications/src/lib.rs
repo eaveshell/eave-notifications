@@ -7,12 +7,13 @@
 //! If another notification daemon is running, it keeps the notifications, and the bell is dimmed
 //! until it quits.
 
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 use eave_api::time::{Duration, every};
 use eave_api::ui::{self, Icon, Item, Notice, Panel, Tone, Urgency};
 use eave_api::{Effect, Nudge, Registry, Subscription, Task, Widget};
-use eave_notify::{Event, Notification, Reason, Timeout};
+use eave_notify::{Event, Icon as Picture, Notification, Reason, Timeout};
 use serde::Deserialize;
 
 pub fn register(registry: &mut Registry) {
@@ -65,8 +66,8 @@ pub struct Notifications {
     expanded: Option<u32>,
     /// The one the History tab shows all of.
     expanded_past: Option<u32>,
-    /// The one being answered, and the answer so far.
-    answering: Option<(u32, String)>,
+    /// What's been typed into each one's reply field so far.
+    drafts: HashMap<u32, String>,
     /// The time the popover's "ago"s are counted from.
     now: SystemTime,
 }
@@ -86,12 +87,10 @@ pub enum Message {
     Expand(u32),
     /// The same, in the History tab.
     ExpandPast(u32),
-    /// Its Reply button: shows a field to type the answer in.
-    StartReply(u32),
-    /// The answer as typed so far.
-    Draft(String),
-    SendReply,
-    CancelReply,
+    /// The answer to it as typed so far.
+    Draft(u32, String),
+    SendReply(u32),
+    CancelReply(u32),
     Clear,
     ToggleQuiet,
     Opened,
@@ -115,7 +114,7 @@ impl Widget for Notifications {
             open: false,
             expanded: None,
             expanded_past: None,
-            answering: None,
+            drafts: HashMap::new(),
             now: SystemTime::now(),
         };
         (notifications, Task::none())
@@ -159,26 +158,19 @@ impl Widget for Notifications {
                     None => self.update(Message::Dismiss(id)),
                 }
             }
-            Message::StartReply(id) => {
-                self.answering = Some((id, String::new()));
+            Message::Draft(id, text) => {
+                self.drafts.insert(id, text);
                 Effect::none()
             }
-            Message::Draft(text) => {
-                if let Some((_, draft)) = &mut self.answering {
-                    *draft = text;
-                }
+            Message::CancelReply(id) => {
+                self.drafts.remove(&id);
                 Effect::none()
             }
-            Message::CancelReply => {
-                self.answering = None;
-                Effect::none()
-            }
-            Message::SendReply => {
-                let Some((id, text)) = self.answering.take() else {
+            Message::SendReply(id) => {
+                let Some(text) = self.drafts.get(&id).cloned() else {
                     return Effect::none();
                 };
                 if text.trim().is_empty() {
-                    self.answering = Some((id, text));
                     return Effect::none();
                 }
                 self.forget(id);
@@ -226,7 +218,6 @@ impl Widget for Notifications {
                 self.open = false;
                 self.expanded = None;
                 self.expanded_past = None;
-                self.answering = None;
                 // Seen, so read: they go on to the history, and the next open starts empty.
                 self.clear()
             }
@@ -400,13 +391,7 @@ impl Notifications {
         self.shown.retain(|shown| *shown != id);
         self.inbox.retain(|notification| notification.id != id);
         self.unread.retain(|unread| *unread != id);
-        if self
-            .answering
-            .as_ref()
-            .is_some_and(|(answering, _)| *answering == id)
-        {
-            self.answering = None;
-        }
+        self.drafts.remove(&id);
     }
 
     fn notice(&self, notification: &Notification) -> Notice<Message> {
@@ -425,17 +410,19 @@ impl Notifications {
         if let Some(icon) = icon(notification) {
             notice = notice.app_icon(icon);
         }
+        if let Some(Picture::File(url)) = &notification.icon {
+            notice = notice.image(url);
+        }
         if !notification.body.is_empty() {
             notice = notice.body(&notification.body);
-        }
-        // Answering it: a field. Otherwise its Reply button comes first: answering is what a
-        // message is for.
-        match (&notification.reply, self.draft(id)) {
-            (Some(reply), Some(draft)) => notice = notice.reply(reply_field(reply, draft)),
-            (Some(reply), None) => {
-                notice = notice.action(reply_label(reply), Message::StartReply(id));
+            if notification.markdown {
+                notice = notice.markdown();
             }
-            (None, _) => {}
+        }
+        // Its field, ready: answering is what a message is for. The bar takes the keyboard only
+        // once it's clicked.
+        if let Some(reply) = &notification.reply {
+            notice = notice.reply(reply_field(id, reply, self.draft(id)));
         }
         for (key, label) in &notification.actions {
             // The default action is a click on the notification, not a button.
@@ -456,10 +443,7 @@ impl Notifications {
 
     fn row(&self, notification: &Notification) -> ui::Node<Message> {
         let id = notification.id;
-        let leading = match icon(notification) {
-            Some(icon) => ui::app_icon(icon),
-            None => ui::icon(Icon::Bell { muted: false }),
-        };
+        let leading = leading(notification);
         let subtitle = match notification.body.lines().next() {
             Some(line) if !line.is_empty() => line.to_string(),
             _ => notification.app.clone(),
@@ -477,8 +461,7 @@ impl Notifications {
             return row;
         }
         // All of the body, then a button per action, the default one first and main.
-        let body =
-            (!notification.body.is_empty()).then(|| ui::label(&notification.body).tone(Tone::Dim));
+        let body = (!notification.body.is_empty()).then(|| body(notification));
         let mut actions: Vec<_> = notification.actions.iter().collect();
         actions.sort_by_key(|(key, _)| key != "default");
         let buttons = actions.into_iter().map(|(key, label)| {
@@ -493,39 +476,25 @@ impl Notifications {
                 button
             }
         });
-        // Answering it: a field. Otherwise its Reply button comes first.
-        let (field, reply) = match (&notification.reply, self.draft(id)) {
-            (Some(reply), Some(draft)) => {
-                let field = ui::text_input(
-                    reply.placeholder.as_deref().unwrap_or("Reply"),
-                    draft,
-                    Message::Draft,
-                )
-                .on_submit(Message::SendReply)
-                .trailing(ui::button(ui::icon(Icon::Forward), Message::SendReply));
-                (Some(field), None)
-            }
-            (Some(reply), None) => (
-                None,
-                Some(ui::button(
-                    ui::label(reply_label(reply)),
-                    Message::StartReply(id),
-                )),
-            ),
-            (None, _) => (None, None),
-        };
-        let buttons: Vec<_> = reply.into_iter().chain(buttons).collect();
+        // Its field, ready to type into.
+        let field = notification.reply.as_ref().map(|reply| {
+            ui::text_area(
+                reply.placeholder.as_deref().unwrap_or("Reply"),
+                self.draft(id),
+                move |text| Message::Draft(id, text),
+            )
+            .on_submit(Message::SendReply(id))
+            .trailing(ui::button(ui::icon(Icon::Forward), Message::SendReply(id)))
+        });
+        let buttons: Vec<_> = buttons.collect();
         let buttons =
             (!buttons.is_empty()).then(|| ui::row(std::iter::once(ui::fill()).chain(buttons)));
         ui::column([Some(row), body, field, buttons].into_iter().flatten())
     }
 
-    /// The answer typed so far into `id`, if it's being answered.
-    fn draft(&self, id: u32) -> Option<&str> {
-        self.answering
-            .as_ref()
-            .filter(|(answering, _)| *answering == id)
-            .map(|(_, draft)| draft.as_str())
+    /// The answer typed so far into `id`.
+    fn draft(&self, id: u32) -> &str {
+        self.drafts.get(&id).map_or("", String::as_str)
     }
 }
 
@@ -534,10 +503,7 @@ impl Notifications {
     /// actions are gone: the app was told it closed.
     fn past_row(&self, notification: &Notification) -> ui::Node<Message> {
         let id = notification.id;
-        let leading = match icon(notification) {
-            Some(icon) => ui::app_icon(icon),
-            None => ui::icon(Icon::Bell { muted: false }),
-        };
+        let leading = leading(notification);
         let expanded = self.expanded_past == Some(id);
         let subtitle = match notification.body.lines().next() {
             Some(line) if !line.is_empty() && !expanded => line.to_string(),
@@ -551,35 +517,49 @@ impl Notifications {
         if !expanded || notification.body.is_empty() {
             return row;
         }
-        ui::column([row, ui::label(&notification.body).tone(Tone::Dim)])
-    }
-}
-
-/// What to call the button that starts an answer.
-fn reply_label(reply: &eave_notify::Reply) -> &str {
-    match reply.label.as_str() {
-        "" | "inline-reply" => "Reply",
-        label => label,
+        ui::column([row, body(notification)])
     }
 }
 
 /// The field to type an answer into, on a notification in the island.
-fn reply_field(reply: &eave_notify::Reply, draft: &str) -> ui::Reply<Message> {
+fn reply_field(id: u32, reply: &eave_notify::Reply, draft: &str) -> ui::Reply<Message> {
     ui::Reply::new(
         reply.placeholder.as_deref().unwrap_or("Reply"),
         draft,
-        Message::Draft,
+        move |text| Message::Draft(id, text),
     )
-    .on_submit(Message::SendReply)
-    .on_cancel(Message::CancelReply)
+    .on_submit(Message::SendReply(id))
+    .on_cancel(Message::CancelReply(id))
 }
 
 /// The app id to show the icon of: the one it gave, or its name.
 fn icon(notification: &Notification) -> Option<String> {
-    notification
-        .icon
-        .clone()
-        .or_else(|| Some(notification.app.to_lowercase()).filter(|app| !app.is_empty()))
+    let given = match &notification.icon {
+        Some(Picture::App(id)) => Some(id.clone()),
+        _ => None,
+    };
+    given.or_else(|| Some(notification.app.to_lowercase()).filter(|app| !app.is_empty()))
+}
+
+/// Its icon in the popover's lists: its picture, its app's icon, or a bell.
+fn leading(notification: &Notification) -> ui::Node<Message> {
+    let fallback = match icon(notification) {
+        Some(icon) => ui::app_icon(icon),
+        None => ui::icon(Icon::Bell { muted: false }),
+    };
+    match &notification.icon {
+        Some(Picture::File(url)) => ui::cover(url, fallback),
+        _ => fallback,
+    }
+}
+
+/// All of its body, dimmed: Markdown if the app said so.
+fn body(notification: &Notification) -> ui::Node<Message> {
+    if notification.markdown {
+        ui::markdown(&notification.body).tone(Tone::Dim)
+    } else {
+        ui::label(&notification.body).tone(Tone::Dim)
+    }
 }
 
 /// Tells the app its notification is gone.
@@ -620,6 +600,7 @@ mod tests {
             icon: None,
             summary: format!("summary {id}"),
             body: String::new(),
+            markdown: false,
             actions: vec![
                 ("default".into(), "Open".into()),
                 ("reply".into(), "Reply".into()),
@@ -753,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn answering_shows_a_field_and_sending_takes_the_notification_away() {
+    fn a_reply_field_shows_at_once_and_sending_takes_the_notification_away() {
         let mut widget = notifications();
         let mut message = notification(1, eave_notify::Urgency::Normal);
         message.reply = Some(eave_notify::Reply {
@@ -772,16 +753,13 @@ mod tests {
                 .reply
                 .is_some()
         };
-        assert!(!field(&widget), "only once asked");
-
-        let _ = widget.update(Message::StartReply(1));
-        assert!(field(&widget));
+        assert!(field(&widget), "ready, no Reply button first");
         // Nothing typed: nothing sent.
-        let _ = widget.update(Message::SendReply);
+        let _ = widget.update(Message::SendReply(1));
         assert!(field(&widget));
 
-        let _ = widget.update(Message::Draft("on my way".into()));
-        let _ = widget.update(Message::SendReply);
+        let _ = widget.update(Message::Draft(1, "on my way".into()));
+        let _ = widget.update(Message::SendReply(1));
         assert!(widget.notices().is_empty());
         assert!(widget.inbox.is_empty());
         assert_eq!(widget.past.len(), 1, "still in the history");

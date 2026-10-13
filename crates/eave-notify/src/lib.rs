@@ -36,12 +36,14 @@ pub struct Notification {
     pub id: u32,
     /// The app's name, as it gave it. May be empty.
     pub app: String,
-    /// An app id to find its icon by: the `desktop-entry` hint, or the app's icon if it named
-    /// one rather than a file.
-    pub icon: Option<String>,
+    /// Its icon: an app id to find it by, or a picture file.
+    pub icon: Option<Icon>,
     pub summary: String,
-    /// Plain text: markup stripped, entities decoded.
+    /// Plain text, markup stripped and entities decoded. Or Markdown as the app wrote it, if
+    /// [`markdown`](Self::markdown).
     pub body: String,
+    /// The body is Markdown: the app said so with the `x-eave-markdown` hint.
+    pub markdown: bool,
     /// Each action's key and label, in order. The `default` one is what clicking the
     /// notification does. An `inline-reply` one is in [`reply`](Self::reply) instead.
     pub actions: Vec<(String, String)>,
@@ -60,6 +62,16 @@ impl Notification {
             .find(|(key, _)| key == "default")
             .map(|(_, label)| label.as_str())
     }
+}
+
+/// Where a notification's icon comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Icon {
+    /// An app id to find it in the icon theme by: the `desktop-entry` hint, or an `app_icon`
+    /// that names an icon.
+    App(String),
+    /// A picture file, as a `file://` URL: the `image-path` hint, or an `app_icon` that is a path.
+    File(String),
 }
 
 /// A notification's inline reply: KDE's extension to the spec, which messengers use. The app
@@ -285,7 +297,14 @@ struct Notifications;
 #[zbus::interface(name = "org.freedesktop.Notifications")]
 impl Notifications {
     fn get_capabilities(&self) -> Vec<&'static str> {
-        vec!["actions", "body", "body-markup", "inline-reply"]
+        vec![
+            "actions",
+            "body",
+            "body-markup",
+            "icon-static",
+            "inline-reply",
+            "x-eave-markdown",
+        ]
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -305,13 +324,15 @@ impl Notifications {
             id => id,
         };
         let (reply, actions) = split_reply(pairs(actions), &hints);
+        let markdown = flag(&hints, "x-eave-markdown");
         let notification = Notification {
             id,
             reply,
             icon: icon(&app_icon, &hints),
             app: app_name,
             summary: strip(&summary),
-            body: strip(&body),
+            body: if markdown { body } else { strip(&body) },
+            markdown,
             actions,
             urgency: urgency(&hints),
             timeout: timeout(expire_timeout, urgency(&hints)),
@@ -330,15 +351,46 @@ impl Notifications {
     }
 }
 
-/// An app id for the icon: the `desktop-entry` hint, or the app icon if it's a name rather than
-/// a path or URI.
-fn icon(app_icon: &str, hints: &HashMap<String, OwnedValue>) -> Option<String> {
-    let entry = hints
-        .get("desktop-entry")
-        .and_then(|value| <&str>::try_from(value).ok())
-        .filter(|entry| !entry.is_empty());
-    let named = Some(app_icon).filter(|icon| !icon.is_empty() && !icon.contains('/'));
-    entry.or(named).map(str::to_string)
+/// The icon: a picture file the app gave (the `image-path` hint, or a path as its icon), else
+/// an app id (the `desktop-entry` hint, or its icon's name).
+fn icon(app_icon: &str, hints: &HashMap<String, OwnedValue>) -> Option<Icon> {
+    let text = |hint: &str| {
+        hints
+            .get(hint)
+            .and_then(|value| <&str>::try_from(value).ok())
+            .filter(|text| !text.is_empty())
+    };
+    let file = |path: &str| {
+        if path.starts_with("file://") {
+            Some(path.to_string())
+        } else if path.starts_with('/') {
+            Some(format!("file://{path}"))
+        } else {
+            None
+        }
+    };
+    let picture = text("image-path")
+        .or(text("image_path"))
+        .and_then(file)
+        .or_else(|| file(app_icon));
+    if let Some(picture) = picture {
+        return Some(Icon::File(picture));
+    }
+    // An image-path may also name an icon, as app_icon can.
+    let named = |name: &str| (!name.is_empty() && !name.contains('/')).then(|| name.to_string());
+    text("desktop-entry")
+        .map(str::to_string)
+        .or_else(|| named(app_icon))
+        .or_else(|| text("image-path").and_then(named))
+        .map(Icon::App)
+}
+
+/// A boolean hint, false if it's missing or not a boolean.
+fn flag(hints: &HashMap<String, OwnedValue>, hint: &str) -> bool {
+    hints
+        .get(hint)
+        .and_then(|value| bool::try_from(value).ok())
+        .unwrap_or(false)
 }
 
 fn urgency(hints: &HashMap<String, OwnedValue>) -> Urgency {
@@ -430,17 +482,46 @@ mod tests {
         assert_eq!(urgency(&hints(&[("urgency", 0u8.into())])), Urgency::Low);
     }
 
+    fn text(text: &str) -> OwnedValue {
+        OwnedValue::try_from(zbus::zvariant::Value::from(text)).unwrap()
+    }
+
     #[test]
-    fn the_icon_is_an_app_id_never_a_path() {
-        let entry = hints(&[(
-            "desktop-entry",
-            OwnedValue::try_from(zbus::zvariant::Value::from("org.gnome.Nautilus")).unwrap(),
-        )]);
-        assert_eq!(icon("x", &entry).as_deref(), Some("org.gnome.Nautilus"));
-        assert_eq!(icon("firefox", &hints(&[])).as_deref(), Some("firefox"));
-        assert_eq!(icon("/tmp/a.png", &hints(&[])), None);
-        assert_eq!(icon("file:///tmp/a.png", &hints(&[])), None);
+    fn the_icon_is_an_app_id_or_a_file() {
+        let entry = hints(&[("desktop-entry", text("org.gnome.Nautilus"))]);
+        let app = |id: &str| Some(Icon::App(id.into()));
+        let file = |url: &str| Some(Icon::File(url.into()));
+        assert_eq!(icon("x", &entry), app("org.gnome.Nautilus"));
+        assert_eq!(icon("firefox", &hints(&[])), app("firefox"));
+        assert_eq!(icon("/tmp/a.png", &hints(&[])), file("file:///tmp/a.png"));
+        assert_eq!(
+            icon("file:///tmp/a.png", &hints(&[])),
+            file("file:///tmp/a.png")
+        );
         assert_eq!(icon("", &hints(&[])), None);
+        // A picture wins over the app's id.
+        let both = hints(&[
+            ("desktop-entry", text("claude")),
+            ("image-path", text("/run/claude.svg")),
+        ]);
+        assert_eq!(icon("", &both), file("file:///run/claude.svg"));
+        assert_eq!(
+            icon("", &hints(&[("image-path", text("mail"))])),
+            app("mail")
+        );
+    }
+
+    #[test]
+    fn markdown_is_a_flag() {
+        assert!(flag(
+            &hints(&[("x-eave-markdown", true.into())]),
+            "x-eave-markdown"
+        ));
+        assert!(!flag(
+            &hints(&[("x-eave-markdown", text("yes"))]),
+            "x-eave-markdown"
+        ));
+        assert!(!flag(&hints(&[]), "x-eave-markdown"));
     }
 
     #[test]

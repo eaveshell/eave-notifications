@@ -19,7 +19,11 @@ shows when it doesn't say, default 5) and `history` (how many the History tab ke
   buttons, and a bar across its top for the time it has left. Pointing at them stops the clock.
   A click runs its default action, or dismisses it.
 - **Answering:** messengers that offer a reply (KDE's `inline-reply`, which Telegram and KDE
-  Connect use) get a Reply button, then a field. The bar takes the keyboard only while it shows.
+  Connect use) get a field to type into, right on the notification: Enter sends, Shift+Enter
+  starts a new line. The bar takes the keyboard only once you click it, and Esc gives it back.
+- **Icons and Markdown:** an app's icon comes from your icon theme, or from a picture file the app
+  names (`image-path`, or a path as its icon). An app that sends the `x-eave-markdown` hint gets its
+  body set as Markdown.
 - **The bell:** a count of the ones that arrived since you last looked and that you didn't deal
   with yourself. Right click for do not disturb: only critical ones show, the rest only go to the
   list. In its popover: the ones waiting for you (click one for all of it and its actions), and a

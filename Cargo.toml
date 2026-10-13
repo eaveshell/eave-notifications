@@ -10,7 +10,7 @@ repository = "https://github.com/eaveshell/eave-notifications"
 [workspace.dependencies]
 # From crates.io. When eave-build compiles the plugin into a bar, it patches eave-api to the eave
 # it builds, so the host and the plugin share one.
-eave-api = "0.1"
-eave-notify = { path = "crates/eave-notify", version = "0.1.0" }
+eave-api = "0.1.2"
+eave-notify = { path = "crates/eave-notify", version = "0.2.0" }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"] }
