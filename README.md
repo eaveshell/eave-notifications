@@ -28,7 +28,9 @@ shows when it doesn't say, default 5) and `history` (how many the History tab ke
   it, and Esc gives it back.
 - **Pictures, icons and Markdown:** a notification's picture is the pixels it sends
   (`image-data`, which messengers and browsers use for avatars), or a file it names (`image-path`,
-  or a path as its icon). An app's icon comes from your icon theme. An app that sends the
+  or a path as its icon). An app's icon comes from your icon theme. An icon named for the device
+  rather than an app (`battery-caution`, `audio-volume-muted`, `network-wireless-offline`…)
+  shows as eave's own symbol, and one with no icon to be found shows a bell. An app that sends the
   `x-eave-markdown` hint gets its body set as Markdown.
 - **eave's own hints**, for apps that want more (eave-claude uses them): `x-eave-thread` and
   `x-eave-thread-name` say which conversation it's part of; `x-eave-icon` is a file for the app's
@@ -43,6 +45,7 @@ shows when it doesn't say, default 5) and `history` (how many the History tab ke
   newest app first, a row per conversation (click one for all of it, its actions and its reply
   field), and a History tab with every one that arrived. Once you've looked, they're read: closing the popover
   moves them on to the history.
+- **In the dormer:** turn do not disturb on or off, and clear the notifications.
 
 Only one program can be the notification daemon. If mako, dunst or swaync is running, eave waits
 in line and takes over once it quits: stop starting it, then quit it. Notifications sent while

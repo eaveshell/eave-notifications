@@ -410,6 +410,34 @@ impl Widget for Notifications {
         )
     }
 
+    /// Do not disturb on or off, and clearing the list when there's anything in it.
+    fn actions(&self) -> Vec<ui::Action<Message>> {
+        let words = ["notifications", "dnd", "quiet", "silence"];
+        let (title, muted) = if self.quiet {
+            ("Turn off Do not disturb", false)
+        } else {
+            ("Turn on Do not disturb", true)
+        };
+        let mut actions = vec![
+            ui::action(title, Message::ToggleQuiet)
+                .keywords(words)
+                .leading(ui::icon(Icon::Bell { muted })),
+        ];
+        if !self.inbox.is_empty() {
+            let count = match self.inbox.len() {
+                1 => "1 notification".to_string(),
+                n => format!("{n} notifications"),
+            };
+            actions.push(
+                ui::action("Clear notifications", Message::Clear)
+                    .subtitle(count)
+                    .keywords(["dismiss", "notifications"])
+                    .leading(ui::icon(Icon::Close)),
+            );
+        }
+        actions
+    }
+
     fn notices(&self) -> Vec<Notice<Message>> {
         self.shown
             .iter()
@@ -521,7 +549,9 @@ impl Notifications {
         if !notification.app.is_empty() {
             notice = notice.app(&notification.app);
         }
-        if let Some(icon) = icon(notification) {
+        if let Some(symbol) = symbol(notification) {
+            notice = notice.icon(symbol);
+        } else if let Some(icon) = icon(notification) {
             notice = notice.app_icon(icon);
         }
         match &notification.image {
@@ -818,9 +848,81 @@ fn icon(notification: &Notification) -> Option<String> {
     given.or_else(|| Some(notification.app.to_lowercase()).filter(|app| !app.is_empty()))
 }
 
-/// Its icon in the popover's lists: its picture, its app's icon, or a bell.
+/// The symbol for an icon named by the freedesktop naming spec that's about the device, not an
+/// app: `battery-caution`, `audio-volume-muted-symbolic`. Themes rarely have them all, and eave
+/// draws its own.
+fn symbol(notification: &Notification) -> Option<Icon> {
+    let Some(AppIcon::App(name)) = &notification.icon else {
+        return None;
+    };
+    named(name)
+}
+
+fn named(name: &str) -> Option<Icon> {
+    let name = name.strip_suffix("-symbolic").unwrap_or(name);
+    let has = |word: &str| name.split('-').any(|part| part == word);
+    let level = || {
+        if has("muted") || has("off") || has("empty") || has("none") {
+            0.0
+        } else if has("caution") || has("critical") {
+            0.1
+        } else if has("low") || has("weak") {
+            0.3
+        } else if has("medium") || has("ok") || has("good") {
+            0.6
+        } else {
+            1.0
+        }
+    };
+    let icon = if name.starts_with("battery") {
+        Icon::Battery {
+            charge: level(),
+            charging: has("charging") || has("charged"),
+        }
+    } else if name.starts_with("audio-volume") {
+        Icon::Volume {
+            level: level(),
+            muted: has("muted"),
+        }
+    } else if name.starts_with("microphone") || name.starts_with("audio-input-microphone") {
+        Icon::Mic {
+            muted: has("muted"),
+        }
+    } else if name.starts_with("network-wireless") {
+        let off = has("offline") || has("disconnected") || has("none");
+        Icon::Wifi {
+            strength: (!off).then(level),
+        }
+    } else if name.starts_with("network-wired") {
+        Icon::Wired
+    } else if name.starts_with("display-brightness") || name.starts_with("brightness") {
+        Icon::Brightness { level: level() }
+    } else if name.starts_with("keyboard-brightness") {
+        Icon::KeyboardLight
+    } else {
+        match name {
+            "media-playback-start" => Icon::Play,
+            "media-playback-pause" | "media-playback-stop" => Icon::Pause,
+            "media-skip-forward" => Icon::Next,
+            "media-skip-backward" => Icon::Previous,
+            "audio-headphones" | "audio-headset" => Icon::Headphones,
+            "audio-speakers" => Icon::Speaker,
+            "video-display" => Icon::Display,
+            "dialog-information" => Icon::Info,
+            "notification" | "notifications" | "preferences-system-notifications" => {
+                Icon::Bell { muted: false }
+            }
+            "notifications-disabled" => Icon::Bell { muted: true },
+            _ => return None,
+        }
+    };
+    Some(icon)
+}
+
+/// Its icon in the popover's lists: its picture, its symbol or app's icon, or a bell.
 fn leading(notification: &Notification) -> ui::Node<Message> {
     let fallback = match (&notification.icon, icon(notification)) {
+        _ if let Some(symbol) = symbol(notification) => ui::icon(symbol),
         (Some(AppIcon::File(url)), _) => ui::cover(url, ui::icon(Icon::Bell { muted: false })),
         (_, Some(icon)) => ui::app_icon(icon),
         (_, None) => ui::icon(Icon::Bell { muted: false }),
@@ -988,6 +1090,78 @@ mod tests {
         arrive(&mut widget, 3);
         let _ = widget.update(Message::ToggleQuiet);
         assert_eq!(badge(&widget), 3, "what came while quiet shows after");
+    }
+
+    #[test]
+    fn device_icons_become_symbols() {
+        assert_eq!(
+            named("battery-caution"),
+            Some(Icon::Battery {
+                charge: 0.1,
+                charging: false
+            })
+        );
+        assert_eq!(
+            named("battery-full-charged-symbolic"),
+            Some(Icon::Battery {
+                charge: 1.0,
+                charging: true
+            })
+        );
+        assert_eq!(
+            named("audio-volume-muted"),
+            Some(Icon::Volume {
+                level: 0.0,
+                muted: true
+            })
+        );
+        assert_eq!(
+            named("network-wireless-offline-symbolic"),
+            Some(Icon::Wifi { strength: None })
+        );
+        assert_eq!(named("firefox"), None);
+        assert_eq!(named("mail-unread"), None);
+    }
+
+    #[test]
+    fn a_device_notification_gets_a_symbol_not_an_app_icon() {
+        let mut widget = notifications();
+        let mut low = notification(1, eave_notify::Urgency::Critical);
+        low.icon = Some(AppIcon::App("battery-caution".into()));
+        arrive_as(&mut widget, low);
+        arrive(&mut widget, 2);
+        let parts: Vec<_> = widget
+            .notices()
+            .into_iter()
+            .map(Notice::into_parts)
+            .collect();
+        let battery = parts.iter().find(|parts| parts.key == 1).unwrap();
+        assert!(matches!(battery.icon, Some(Icon::Battery { .. })));
+        assert_eq!(battery.app_icon, None);
+        let app = parts.iter().find(|parts| parts.key == 2).unwrap();
+        assert_eq!(app.icon, None);
+        assert_eq!(app.app_icon.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn actions_silence_and_clear() {
+        let titles = |widget: &Notifications| -> Vec<String> {
+            widget
+                .actions()
+                .iter()
+                .map(|action| action.title().to_string())
+                .collect()
+        };
+        let mut widget = notifications();
+        assert_eq!(titles(&widget), ["Turn on Do not disturb"]);
+        arrive(&mut widget, 1);
+        assert_eq!(
+            titles(&widget),
+            ["Turn on Do not disturb", "Clear notifications"]
+        );
+        let _ = widget.update(Message::ToggleQuiet);
+        let _ = widget.update(Message::Clear);
+        assert_eq!(titles(&widget), ["Turn off Do not disturb"]);
     }
 
     #[test]
