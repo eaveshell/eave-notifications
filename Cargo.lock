@@ -68,9 +68,9 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "eave-api"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ac475d236fd7dfdd4380b274bbb1757514b7f11673f3f980360b4ab4532fa7d"
+checksum = "4edfd70fae5db4bcd68f891a27fdd377810dd215f705beba8248bcfa030ea04d"
 dependencies = [
  "iced_futures",
  "iced_runtime",
